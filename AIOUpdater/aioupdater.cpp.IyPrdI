@@ -1,0 +1,225 @@
+#include "aioupdater.h"
+#include "Logging/CELL.hpp"
+#include "VersionInfo/zjsontools.hpp"
+#include "VersionInfo/upgradeaccess.h"
+#include "VersionInfo/httpcommon.h"
+#include "VersionInfo/appconfig.h"
+#include "Updater/rollbackmechanism.h"
+
+AIOUpdater::AIOUpdater(QObject *parent) : QObject(parent)
+{
+    u_Dialog = new UpdaterDialog();
+    m_appSwitch = new ExternalAppSwitch();
+
+    u_Dialog->show();
+    m_status = true;
+    qDebug() << "OpenSSL Support: " << QSslSocket::supportsSsl();
+    connect(this,&AIOUpdater::decompress_signal,compreDecompreFileThread,&CompreDecompreFileThread::decompression_file_run);
+    connect(compreDecompreFileThread,&CompreDecompreFileThread::decompression_res_signal,this,&AIOUpdater::decompress_res_slot);
+    connect(u_Dialog, SIGNAL(fileDownloadStatu(bool)), this, SLOT(downloadFileFinished(bool)));
+}
+
+AIOUpdater::~AIOUpdater()
+{
+    delete u_Dialog;
+    u_Dialog = nullptr;
+
+    delete m_appSwitch;
+    m_appSwitch = nullptr;
+}
+
+void AIOUpdater::onDeviceLogin(QByteArray deviceMac)
+{
+    QObject::connect(HttpCommon::instance(), &HttpCommon::httpPostRspReady, [&](QString url, QString postMD5, QByteArray d){
+       qDebug()<<postMD5;
+       if(url != nullptr && d != nullptr)
+       {
+           ZJsonTools::Print(d);
+           queryUpdateInfo();
+       }
+    });
+    QString url = UpgradeAccess::instance()->DeviceLogin();
+    HttpCommon::instance()->httpPost(url, deviceMac);
+}
+
+void AIOUpdater::GetVerDto(QString param)
+{
+    QObject::connect(HttpCommon::instance(), &HttpCommon::httpGetRspReady, [&](QString url, QByteArray d){
+       if(url != nullptr && d != nullptr)
+       {
+           ZJsonTools::Print(d);
+           setVerDto(d);
+       }
+    });
+    QString url = UpgradeAccess::instance()->QueryVerInfo(param);
+    HttpCommon::instance()->httpGet(url);
+}
+
+void AIOUpdater::GetSysFileInfo(QString param)
+{
+    QObject::connect(HttpCommon::instance(), &HttpCommon::httpGetRspReady, [&](QString url, QByteArray d){
+       if(url != nullptr && d != nullptr)
+       {
+           ZJsonTools::Print(d);
+           setSysFileInfo(d);
+       }
+    });
+    QString url = UpgradeAccess::instance()->QueryFileInfo(param);
+    HttpCommon::instance()->httpGet(url);
+}
+
+void AIOUpdater::setSysFileInfo(QByteArray responce)
+{
+    QJsonParseError jsonError;
+    QJsonDocument document = QJsonDocument::fromJson(responce, &jsonError);
+    if(!document.isNull() && (QJsonParseError::NoError == jsonError.error))
+    {
+       QJsonObject obj = document.object();
+       if(obj.contains("data"))
+       {
+            QJsonObject val = obj.take("data").toObject();
+            u_file.set_id(val["id"].toVariant().toString());
+            u_file.set_md5(val["md5"].toVariant().toString());
+            u_file.set_sizeKb(val["sizeKb"].toVariant().toString());
+            u_file.set_suffix(val["suffix"].toVariant().toString());
+            u_file.set_filePath(val["filePath"].toVariant().toString());
+            u_file.set_sizeInfo(val["sizeInfo"].toVariant().toString());
+            u_file.set_bucketName(val["bucketName"].toVariant().toString());
+            u_file.set_fileLocation((OSSProvider)val["sizeKb"].toVariant().toInt());
+            u_file.set_fileObjectName(val["fileObjectName"].toVariant().toString());
+            u_file.set_fileOriginName(val["fileOriginName"].toVariant().toString());
+            u_file.set_createTime(val["createTime"].toVariant().toString());
+            u_file.set_updateTime(val["updateTime"].toVariant().toString());
+            u_file.set_createdUserId(val["createdUserId"].toVariant().toString());
+            u_file.set_createdUesrName(val["createdUesrName"].toVariant().toString());
+            u_file.set_updatedUserId(val["updatedUserId"].toVariant().toString());
+            u_file.set_updatedUserName(val["updatedUserName"].toVariant().toString());
+            u_file.set_isDelete(val["isDelete"].toVariant().toInt());
+//            qDebug() << "======" << u_file.toString();
+            GetObsFileInfo(QJsonArray("ID"));
+       }
+    }
+}
+
+void AIOUpdater::setVerDto(QByteArray responce)
+{
+    QJsonParseError jsonError;
+    QJsonDocument document = QJsonDocument::fromJson(responce, &jsonError);
+    if(!document.isNull() && (QJsonParseError::NoError == jsonError.error))
+    {
+       QJsonObject obj = document.object();
+       if(obj.contains("data"))
+       {
+            QJsonArray childArray = obj.take("data").toArray();
+            int i = 0;
+            for(auto iter = childArray.begin(); iter!=childArray.end(); ++iter)
+            {
+                QJsonObject val = (*iter).toObject();
+
+                UpdateVerQueryDto u_file = UpdateVerQueryDto();
+                u_file.set_id(val["id"].toVariant().toString());
+                u_file.set_remark(val["remark"].toVariant().toString());
+                u_file.set_creator(val["creator"].toVariant().toString());
+                u_file.set_version(val["version"].toVariant().toString());
+                u_file.set_isDeleted(val["isDeleted"].toVariant().toBool());
+                u_file.set_isEnabled(val["isEnabled"].toVariant().toBool());
+                u_file.set_operators(val["operators"].toVariant().toString());
+                u_file.set_clientType(val["clientType"].toVariant().toInt());
+                u_file.set_createTime(val["createTime"].toVariant().toString());
+                u_file.set_operateTime(val["operateTime"].toVariant().toString());
+                u_file.set_updateFileId(val["updateFileId"].toVariant().toString());
+                u_file.set_updateContent(val["updateContent"].toVariant().toString());
+                u_verDto.insert(i++, u_file);
+            }
+       }
+    }
+    GetSysFileInfo(u_verDto[0].get_updateFileId());
+}
+
+void AIOUpdater::GetObsFileInfo(QByteArray param)
+{
+    QObject::connect(HttpCommon::instance(), &HttpCommon::httpPostRspReady, [&](QString url, QString postMD5, QByteArray d){
+       qDebug()<<postMD5;
+       if(url != nullptr && d != nullptr)
+       {
+           ZJsonTools::Print(d);
+       }
+    });
+    QString url = UpgradeAccess::instance()->obsFileInfo();
+    HttpCommon::instance()->httpPost(url, param);
+    qDebug() << "========" << param ;
+}
+
+// query update information
+void AIOUpdater::queryUpdateInfo()
+{
+    GetVerDto("?ClientType=1&IsEnabled=false");
+}
+
+// download the files of update
+void AIOUpdater::onDownload()
+{
+    if(m_status)
+    {
+        QString url = "https://mirrors.ustc.edu.cn/qtproject/archive/qt/5.14/5.14.2/submodules/qtandroidextras-everywhere-src-5.14.2.tar.xz";
+//        QString url ="https://iso.mirrors.ustc.edu.cn/qtproject/archive/qt/5.14/5.14.2/submodules/qtgamepad-everywhere-src-5.14.2.zip";
+//        QString url = "https://mirrors.ustc.edu.cn/qtproject/archive/qt/5.14/5.14.2/submodules/qtx11extras-everywhere-src-5.14.2.zip";
+//        u_Dialog->onDownload(url);
+    }
+}
+
+// back up the files that will update
+void AIOUpdater::startBackup()
+{
+    QString filePath = "/home/zhulc/桌面/project/build-AIOUpdater-Desktop_Qt_5_12_8_GCC_64bit-Debug";
+    bool ret = RollbackMechanism::BackupCate(AppSetting::ItcBackupDir, filePath);
+    if(ret)
+    {
+        CELLLog::Info("Info, backup success<%d>...\n", 100);
+    }
+    else
+    {
+        CELLLog::Info("Info, backup failed<%d>...\n", 0);
+    }
+}
+
+// record update process
+void AIOUpdater::update()
+{
+    QByteArray deviceMac("mac=%3A566AE841-A3A3-32BB-FFA6-58112204B271");
+    onDeviceLogin(deviceMac);
+    // 1.
+}
+
+// decompre file and copy the file to the target path
+void AIOUpdater::decompreFile()
+{
+    QString filePath = AppSetting::ItcDownloadDir +"qtdeclarative-everywhere-src-5.14.2.tar.xz";
+    QString zipPath = AppSetting::ITCBoard;
+
+    qDebug() << filePath << zipPath;
+
+    emit  decompress_signal(filePath,zipPath);
+    CELLLog::Info("Info, decompress success<%d>...\n", 100);
+    CELLLog::Info("Info, update success<%d>...\n", 100);
+}
+
+// the switch of process
+void AIOUpdater::uProcessSwitch()
+{
+    m_appSwitch->openApp(AppSetting::ITCBoard);
+    // to do
+}
+
+void AIOUpdater::downloadFileFinished(bool statu)
+{
+    if(statu)
+    {
+        decompreFile();
+    }
+}
+
+void AIOUpdater::decompress_res_slot(CompreDecompreFileThread::ResultE res, quint8 progress, QString remarks)
+{
+    qDebug()<<"deCom:"<<"  res:"<<res<<"  progress:"<<progress<<"  remarks:"<<remarks;
+}
